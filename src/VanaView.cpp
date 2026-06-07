@@ -1,7 +1,7 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 
-#include "../../Ashita/plugins/sdk/Ashita.h"
+#include "Ashita.h"
 
 #include <algorithm>
 #include <cctype>
@@ -242,7 +242,31 @@ namespace
     constexpr float kDefaultDrawDistance = 1.0f;
     constexpr float kMaxDrawDistance = 100.0f;
     constexpr float kDrawDistanceSliderPower = 2.0f;
+    constexpr float kDefaultDrawDistanceSlider = 20.0f;
+    constexpr float kDefaultFogStart = 20.0f;
+    constexpr float kDefaultFogEnd = 120.0f;
     constexpr float kMaxFogDistance = 1000.0f;
+    constexpr float kLodRangeMin = 0.25f;
+    constexpr float kLodRangeMax = 10.0f;
+    constexpr int kConfigVersion = 9;
+    constexpr const char* kZoneProfilesHelp =
+        "When enabled, VanaView loads a profile for the current zone if one exists. "
+        "Zones without a saved profile use the global profile until you save settings for that zone.";
+    constexpr const char* kDistanceHelp =
+        "Raises the game's world and entity draw distance. In Distance fog mode, "
+        "the game's fog range is still linked to this raised distance.";
+    constexpr const char* kLodModeHelp =
+        "Range scales the map LoD checks. Full keeps high-detail map models visible "
+        "and ignores the LoD range slider.";
+    constexpr const char* kLodRangeHelp =
+        "Scales the distance used by the Range LoD patch.";
+    constexpr const char* kLodRangeDisabledHelp =
+        "Disabled while LoD is Full. Switch LoD to Range to tune this value.";
+    constexpr const char* kFogModeHelp =
+        "Distance uses the game's fog exactly as emitted, so it follows raised draw distance. "
+        "Game uses the last natural fog range captured from the game and reapplies it with raised distance; "
+        "it refreshes when the game sends new fog values, such as on zone or weather updates. "
+        "Custom forces the Fog start/end sliders.";
     float g_lodRangeScaleSq = 1.0f;
     uintptr_t g_lodRangeReturn0 = 0;
     uintptr_t g_lodRangeReturn1 = 0;
@@ -259,6 +283,11 @@ namespace
     {
         const float normalized = clamp_float((value - 1.0f) / 99.0f, 0.0f, 1.0f);
         return kDefaultDrawDistance + (std::pow(normalized, kDrawDistanceSliderPower) * (kMaxDrawDistance - kDefaultDrawDistance));
+    }
+
+    float default_draw_distance()
+    {
+        return slider_to_draw_distance(kDefaultDrawDistanceSlider);
     }
 }
 
@@ -339,10 +368,11 @@ public:
 
     void Release(void) override
     {
-        save_config();
+        save_config(false);
+        m_gameFogSampling = false;
         restore_draw_distances();
         restore_lod_patches();
-        m_fogMode = FogMode::Off;
+        m_fogMode = FogMode::DistanceLinked;
         restore_fog_state();
         m_device = nullptr;
     }
@@ -399,9 +429,10 @@ public:
             if (value == nullptr || iequals(value, "status"))
             {
                 chat(
-                    "Zone profiles: %s zone=%u",
+                    "Zone profiles: %s zone=%u profile=%s",
                     m_useZoneProfiles ? "on" : "off",
-                    static_cast<unsigned int>(m_currentZoneId));
+                    static_cast<unsigned int>(m_currentZoneId),
+                    m_activeZoneHasProfile ? "zone" : "global");
                 return true;
             }
             if (iequals(value, "on"))
@@ -469,7 +500,7 @@ public:
             }
             if (std::isdigit(static_cast<unsigned char>(mode[0])) || mode[0] == '.')
             {
-                m_lodRangeScale = clamp_float(std::strtof(mode, nullptr), 0.25f, 10.0f);
+                m_lodRangeScale = clamp_float(std::strtof(mode, nullptr), kLodRangeMin, kLodRangeMax);
                 m_lodMode = LodMode::Range;
                 const bool ok = apply_lod_mode();
                 save_config();
@@ -507,10 +538,32 @@ public:
             }
             if (iequals(mode, "default"))
             {
-                m_fogMode = FogMode::Off;
+                set_fog_mode(FogMode::DistanceLinked);
                 sync_default_fog_range();
+                restore_fog_state();
                 save_config();
-                chat("Fog restored to default.");
+                chat("Fog mode: distance-linked.");
+                return true;
+            }
+            if (iequals(mode, "distance") || iequals(mode, "linked"))
+            {
+                set_fog_mode(FogMode::DistanceLinked);
+                save_config();
+                chat("Fog mode: distance-linked.");
+                return true;
+            }
+            if (iequals(mode, "game") || iequals(mode, "natural"))
+            {
+                set_fog_mode(FogMode::Game);
+                save_config();
+                chat("Fog mode: game values.");
+                return true;
+            }
+            if (iequals(mode, "custom"))
+            {
+                set_fog_mode(FogMode::Custom);
+                save_config();
+                chat("Fog mode: custom %.1f-%.1f.", static_cast<double>(m_fogStart), static_cast<double>(m_fogEnd));
                 return true;
             }
             if (std::isdigit(static_cast<unsigned char>(mode[0])) || mode[0] == '.')
@@ -525,17 +578,28 @@ public:
                 m_fogStart = clamp_float(std::strtof(start, nullptr), 0.0f, kMaxFogDistance);
                 const float requestedEnd = std::strtof(end, nullptr);
                 m_fogEnd = clamp_float(requestedEnd, m_fogStart + 1.0f, kMaxFogDistance);
-                m_fogMode = FogMode::Range;
+                set_fog_mode(FogMode::Custom);
                 save_config();
                 chat("Fog range set to %.1f-%.1f.", static_cast<double>(m_fogStart), static_cast<double>(m_fogEnd));
                 return true;
             }
-            chat("Usage: /vv fog <start> <end> | default");
+            chat("Usage: /vv fog <start> <end> | custom | game | distance | default");
             return true;
         }
 
         print_help();
         return true;
+    }
+
+    void Direct3DBeginScene(bool isRenderingBackBuffer) override
+    {
+        begin_game_fog_sample(isRenderingBackBuffer);
+    }
+
+    void Direct3DEndScene(bool isRenderingBackBuffer) override
+    {
+        if (isRenderingBackBuffer)
+            finish_game_fog_sample();
     }
 
     void Direct3DPresent(const RECT* pSourceRect, const RECT* pDestRect, HWND hDestWindowOverride, const RGNDATA* pDirtyRegion) override
@@ -553,28 +617,93 @@ public:
     {
         if (value == nullptr)
             return false;
+        if (m_applyingForcedFogState)
+            return false;
 
         if (state == D3DRS_FOGSTART)
         {
             capture_original_fog_start(dword_to_float(*value));
-            if (m_fogMode == FogMode::Range)
+            finish_game_fog_sample_if_ready();
+            if (should_force_fog_state())
                 *value = float_to_dword(m_fogStart);
         }
         else if (state == D3DRS_FOGEND)
         {
             capture_original_fog_end(dword_to_float(*value));
-            if (m_fogMode == FogMode::Range)
+            finish_game_fog_sample_if_ready();
+            if (should_force_fog_state())
                 *value = float_to_dword(m_fogEnd);
         }
+        else if (should_force_fog_state() && state == D3DRS_FOGVERTEXMODE)
+        {
+            *value = D3DFOG_LINEAR;
+        }
+        else if (should_force_fog_state() && state == D3DRS_FOGTABLEMODE)
+        {
+            *value = D3DFOG_NONE;
+        }
+        else if (should_force_fog_state() && state == D3DRS_RANGEFOGENABLE)
+        {
+            *value = FALSE;
+        }
 
+        return false;
+    }
+
+    bool Direct3DDrawPrimitive(D3DPRIMITIVETYPE primitiveType, UINT startVertex, UINT primitiveCount) override
+    {
+        UNREFERENCED_PARAMETER(primitiveType);
+        UNREFERENCED_PARAMETER(startVertex);
+        UNREFERENCED_PARAMETER(primitiveCount);
+
+        apply_fog_state_before_draw();
+        return false;
+    }
+
+    bool Direct3DDrawIndexedPrimitive(D3DPRIMITIVETYPE primitiveType, UINT minIndex, UINT numVertices, UINT startIndex, UINT primCount) override
+    {
+        UNREFERENCED_PARAMETER(primitiveType);
+        UNREFERENCED_PARAMETER(minIndex);
+        UNREFERENCED_PARAMETER(numVertices);
+        UNREFERENCED_PARAMETER(startIndex);
+        UNREFERENCED_PARAMETER(primCount);
+
+        apply_fog_state_before_draw();
+        return false;
+    }
+
+    bool Direct3DDrawPrimitiveUP(D3DPRIMITIVETYPE primitiveType, UINT primitiveCount, CONST void* vertexStreamZeroData, UINT vertexStreamZeroStride) override
+    {
+        UNREFERENCED_PARAMETER(primitiveType);
+        UNREFERENCED_PARAMETER(primitiveCount);
+        UNREFERENCED_PARAMETER(vertexStreamZeroData);
+        UNREFERENCED_PARAMETER(vertexStreamZeroStride);
+
+        apply_fog_state_before_draw();
+        return false;
+    }
+
+    bool Direct3DDrawIndexedPrimitiveUP(D3DPRIMITIVETYPE primitiveType, UINT minVertexIndex, UINT numVertexIndices, UINT primitiveCount, CONST void* indexData, D3DFORMAT indexDataFormat, CONST void* vertexStreamZeroData, UINT vertexStreamZeroStride) override
+    {
+        UNREFERENCED_PARAMETER(primitiveType);
+        UNREFERENCED_PARAMETER(minVertexIndex);
+        UNREFERENCED_PARAMETER(numVertexIndices);
+        UNREFERENCED_PARAMETER(primitiveCount);
+        UNREFERENCED_PARAMETER(indexData);
+        UNREFERENCED_PARAMETER(indexDataFormat);
+        UNREFERENCED_PARAMETER(vertexStreamZeroData);
+        UNREFERENCED_PARAMETER(vertexStreamZeroStride);
+
+        apply_fog_state_before_draw();
         return false;
     }
 
 private:
     enum class FogMode : int
     {
-        Off = 0,
-        Range = 1,
+        DistanceLinked = 0,
+        Custom = 1,
+        Game = 2,
     };
 
     void print_help()
@@ -582,7 +711,7 @@ private:
         chat("/vv opens the configuration window");
         chat("/vv distance <1-100> | default");
         chat("/vv lod <scale> | full | default");
-        chat("/vv fog <start> <end> | default");
+        chat("/vv fog <start> <end> | custom | game | distance | default");
         chat("/vv zone on | off | status");
         chat("/vv reset");
         chat("/vv status");
@@ -611,6 +740,66 @@ private:
         if (m_lodMode == LodMode::Range)
             return "range";
         return "default";
+    }
+
+    FogMode parse_fog_mode(const int value) const
+    {
+        if (value == static_cast<int>(FogMode::Custom))
+            return FogMode::Custom;
+        if (value == static_cast<int>(FogMode::Game))
+            return FogMode::Game;
+        return FogMode::DistanceLinked;
+    }
+
+    bool should_force_fog_state() const
+    {
+        return m_fogMode == FogMode::Custom || m_fogMode == FogMode::Game;
+    }
+
+    void set_fog_mode(const FogMode mode)
+    {
+        if (m_fogMode == mode)
+            return;
+
+        finish_game_fog_sample();
+        m_fogMode = mode;
+        apply_active_fog_mode();
+    }
+
+    void apply_active_fog_mode()
+    {
+        if (m_fogMode == FogMode::DistanceLinked)
+        {
+            reset_game_fog_sample(false);
+            restore_fog_state();
+            return;
+        }
+        if (m_fogMode == FogMode::Game)
+        {
+            reset_game_fog_sample(true);
+            apply_forced_fog_state();
+            return;
+        }
+
+        reset_game_fog_sample(false);
+        apply_forced_fog_state();
+    }
+
+    void show_help_marker(IGuiManager* gui, const char* text)
+    {
+        if (gui == nullptr || text == nullptr)
+            return;
+
+        gui->SameLine(0.0f, 4.0f);
+        gui->TextDisabled("(?)");
+        if (!gui->IsItemHovered())
+            return;
+
+        gui->BeginTooltip();
+        gui->PushTextWrapPos(gui->GetFontSize() * 35.0f);
+        gui->TextWrapped("%s", text);
+        gui->PopTextWrapPos();
+        gui->EndTooltip();
     }
 
     int push_theme(IGuiManager* gui)
@@ -661,10 +850,10 @@ private:
 
         auto* gui = m_core->GetGuiManager();
         const int themeCount = push_theme(gui);
-        gui->SetNextWindowSize(ImVec2(430.0f, 360.0f), ImGuiCond_FirstUseEver);
+        gui->SetNextWindowSize(ImVec2(455.0f, 390.0f), ImGuiCond_Always);
 
         bool open = m_windowOpen;
-        if (gui->Begin("VanaView", &open, 0))
+        if (gui->Begin("VanaView", &open, ImGuiWindowFlags_NoResize))
         {
             gui->Text("Visual distance and LoD");
             gui->Separator();
@@ -677,11 +866,19 @@ private:
                 set_zone_profiles_enabled(useZoneProfiles);
                 changed = false;
             }
-            gui->SameLine();
+            show_help_marker(gui, kZoneProfilesHelp);
+            gui->SameLine(0.0f, 12.0f);
             if (m_useZoneProfiles)
-                gui->Text("Zone: %u", static_cast<unsigned int>(m_currentZoneId));
+            {
+                if (m_activeZoneHasProfile)
+                    gui->TextDisabled("| Profile: Zone %u", static_cast<unsigned int>(m_currentZoneId));
+                else
+                    gui->TextDisabled("| Profile: Global fallback (zone %u)", static_cast<unsigned int>(m_currentZoneId));
+            }
             else
-                gui->Text("Global profile");
+            {
+                gui->TextDisabled("| Profile: Global");
+            }
 
             float distance = draw_distance_to_slider(m_drawDistance);
             gui->SetNextItemWidth(260.0f);
@@ -691,9 +888,11 @@ private:
                 apply_draw_distances();
                 changed = true;
             }
+            show_help_marker(gui, kDistanceHelp);
 
             gui->Separator();
             gui->Text("Map LoD");
+            show_help_marker(gui, kLodModeHelp);
 
             int lodMode = static_cast<int>(m_lodMode);
             bool lodChanged = false;
@@ -708,24 +907,45 @@ private:
             }
 
             float lodScale = m_lodRangeScale;
-            gui->SetNextItemWidth(260.0f);
-            if (gui->SliderFloat("LoD range", &lodScale, 0.25f, 10.0f, "%.2fx"))
+            if (m_lodMode == LodMode::High)
             {
-                m_lodRangeScale = clamp_float(lodScale, 0.25f, 10.0f);
-                if (m_lodMode == LodMode::Range)
-                    apply_lod_mode();
-                changed = true;
+                char lodOverlay[32]{};
+                std::snprintf(lodOverlay, sizeof(lodOverlay), "%.2fx", static_cast<double>(lodScale));
+                const float lodProgress = clamp_float((lodScale - kLodRangeMin) / (kLodRangeMax - kLodRangeMin), 0.0f, 1.0f);
+                gui->PushStyleVar(ImGuiStyleVar_Alpha, 0.45f);
+                gui->ProgressBar(lodProgress, ImVec2(260.0f, 0.0f), lodOverlay);
+                gui->SameLine();
+                gui->Text("LoD range");
+                gui->PopStyleVar();
+                show_help_marker(gui, kLodRangeDisabledHelp);
+            }
+            else
+            {
+                gui->SetNextItemWidth(260.0f);
+                if (gui->SliderFloat("LoD range", &lodScale, kLodRangeMin, kLodRangeMax, "%.2fx"))
+                {
+                    m_lodRangeScale = clamp_float(lodScale, kLodRangeMin, kLodRangeMax);
+                    if (m_lodMode == LodMode::Range)
+                        apply_lod_mode();
+                    changed = true;
+                }
+                show_help_marker(gui, kLodRangeHelp);
             }
 
             gui->Separator();
             gui->Text("Fog");
+            show_help_marker(gui, kFogModeHelp);
 
-            bool fogEnabled = m_fogMode == FogMode::Range;
-            if (gui->Checkbox("Custom fog range", &fogEnabled))
+            int fogMode = static_cast<int>(m_fogMode);
+            bool fogModeChanged = false;
+            fogModeChanged = gui->RadioButton("Distance##fog", &fogMode, static_cast<int>(FogMode::DistanceLinked)) || fogModeChanged;
+            gui->SameLine();
+            fogModeChanged = gui->RadioButton("Game##fog", &fogMode, static_cast<int>(FogMode::Game)) || fogModeChanged;
+            gui->SameLine();
+            fogModeChanged = gui->RadioButton("Custom##fog", &fogMode, static_cast<int>(FogMode::Custom)) || fogModeChanged;
+            if (fogModeChanged)
             {
-                m_fogMode = fogEnabled ? FogMode::Range : FogMode::Off;
-                if (!fogEnabled)
-                    restore_fog_state();
+                set_fog_mode(parse_fog_mode(fogMode));
                 changed = true;
             }
 
@@ -739,8 +959,7 @@ private:
             {
                 m_fogStart = clamp_float(fogStart, 0.0f, kMaxFogDistance);
                 m_fogEnd = clamp_float(fogEnd, m_fogStart + 1.0f, kMaxFogDistance);
-                if (m_fogMode == FogMode::Off)
-                    m_fogMode = FogMode::Range;
+                set_fog_mode(FogMode::Custom);
                 changed = true;
             }
 
@@ -770,10 +989,17 @@ private:
 
     void print_fog_status()
     {
-        if (m_fogMode == FogMode::Off)
-            chat("Fog: default");
-        else
-            chat("Fog: %.1f-%.1f", static_cast<double>(m_fogStart), static_cast<double>(m_fogEnd));
+        if (m_fogMode == FogMode::DistanceLinked)
+        {
+            chat("Fog: distance-linked %.1f-%.1f", static_cast<double>(m_fogStart), static_cast<double>(m_fogEnd));
+            return;
+        }
+        if (m_fogMode == FogMode::Game)
+        {
+            chat("Fog: game %.1f-%.1f", static_cast<double>(m_fogStart), static_cast<double>(m_fogEnd));
+            return;
+        }
+        chat("Fog: custom %.1f-%.1f", static_cast<double>(m_fogStart), static_cast<double>(m_fogEnd));
     }
 
     void chat(const char* format, ...)
@@ -817,33 +1043,39 @@ private:
 
         m_useZoneProfiles = ::GetPrivateProfileIntA("general", "use_zone_profiles", 0, m_configPath) != 0;
         load_global_profile(configVersion);
-        save_config();
+        save_config(false);
     }
 
     void load_global_profile(const int configVersion)
     {
-        m_drawDistance = clamp_float(read_profile_float("draw", "distance", read_profile_float("draw", "world", kDefaultDrawDistance)), 1.0f, kMaxDrawDistance);
+        m_drawDistance = clamp_float(read_profile_float("draw", "distance", read_profile_float("draw", "world", default_draw_distance())), 1.0f, kMaxDrawDistance);
         if (configVersion < 8)
-            m_drawDistance = kDefaultDrawDistance;
-        m_lodMode = static_cast<LodMode>(::GetPrivateProfileIntA("lod", "mode", static_cast<int>(LodMode::Range), m_configPath));
-        m_lodRangeScale = clamp_float(read_profile_float("lod", "range_scale", 1.0f), 0.25f, 10.0f);
-        const int rawFogMode = ::GetPrivateProfileIntA("fog", "mode", 0, m_configPath);
-        m_fogMode = rawFogMode == static_cast<int>(FogMode::Range) ? FogMode::Range : FogMode::Off;
-        m_fogStart = clamp_float(read_profile_float("fog", "start", 20.0f), 0.0f, kMaxFogDistance);
-        m_fogEnd = clamp_float(read_profile_float("fog", "end", 120.0f), m_fogStart + 1.0f, kMaxFogDistance);
+            m_drawDistance = default_draw_distance();
+        m_lodMode = static_cast<LodMode>(::GetPrivateProfileIntA("lod", "mode", static_cast<int>(LodMode::High), m_configPath));
+        m_lodRangeScale = clamp_float(read_profile_float("lod", "range_scale", 1.0f), kLodRangeMin, kLodRangeMax);
+        const int rawFogMode = ::GetPrivateProfileIntA("fog", "mode", static_cast<int>(FogMode::Game), m_configPath);
+        m_fogMode = parse_fog_mode(rawFogMode);
+        m_fogStart = clamp_float(read_profile_float("fog", "start", kDefaultFogStart), 0.0f, kMaxFogDistance);
+        m_fogEnd = clamp_float(read_profile_float("fog", "end", kDefaultFogEnd), m_fogStart + 1.0f, kMaxFogDistance);
 
         if (m_lodMode != LodMode::Off && m_lodMode != LodMode::High && m_lodMode != LodMode::Range)
             m_lodMode = LodMode::Range;
     }
 
-    void save_config()
+    void save_config(const bool createZoneProfile = true)
     {
-        ::WritePrivateProfileStringA("general", "version", "8", m_configPath);
+        char version[16]{};
+        std::snprintf(version, sizeof(version), "%d", kConfigVersion);
+        ::WritePrivateProfileStringA("general", "version", version, m_configPath);
         ::WritePrivateProfileStringA("general", "use_zone_profiles", m_useZoneProfiles ? "1" : "0", m_configPath);
         if (m_useZoneProfiles && m_currentZoneId != 0)
         {
-            save_zone_profile(m_currentZoneId);
-            return;
+            if (createZoneProfile || m_activeZoneHasProfile)
+            {
+                save_zone_profile(m_currentZoneId);
+                m_activeZoneHasProfile = true;
+                return;
+            }
         }
         save_global_profile();
     }
@@ -876,22 +1108,23 @@ private:
         std::snprintf(buffer, bufferSize, "zone.%u", static_cast<unsigned int>(zoneId));
     }
 
-    void load_zone_profile(const uint16_t zoneId)
+    bool load_zone_profile(const uint16_t zoneId)
     {
         char section[32]{};
         zone_section_name(zoneId, section, sizeof(section));
         if (!profile_section_exists(section))
-            return;
+            return false;
 
         m_drawDistance = clamp_float(read_profile_float(section, "distance", m_drawDistance), 1.0f, kMaxDrawDistance);
         m_lodMode = static_cast<LodMode>(::GetPrivateProfileIntA(section, "lod_mode", static_cast<int>(m_lodMode == LodMode::Off ? LodMode::Range : m_lodMode), m_configPath));
-        m_lodRangeScale = clamp_float(read_profile_float(section, "lod_range", m_lodRangeScale), 0.25f, 10.0f);
+        m_lodRangeScale = clamp_float(read_profile_float(section, "lod_range", m_lodRangeScale), kLodRangeMin, kLodRangeMax);
         const int rawFogMode = ::GetPrivateProfileIntA(section, "fog_mode", static_cast<int>(m_fogMode), m_configPath);
-        m_fogMode = rawFogMode == static_cast<int>(FogMode::Range) ? FogMode::Range : FogMode::Off;
+        m_fogMode = parse_fog_mode(rawFogMode);
         m_fogStart = clamp_float(read_profile_float(section, "fog_start", m_fogStart), 0.0f, kMaxFogDistance);
         m_fogEnd = clamp_float(read_profile_float(section, "fog_end", m_fogEnd), m_fogStart + 1.0f, kMaxFogDistance);
         if (m_lodMode != LodMode::Off && m_lodMode != LodMode::High && m_lodMode != LodMode::Range)
             m_lodMode = LodMode::Range;
+        return true;
     }
 
     void save_zone_profile(const uint16_t zoneId)
@@ -912,12 +1145,14 @@ private:
 
     void reset_config_to_defaults()
     {
-        m_drawDistance = kDefaultDrawDistance;
-        m_lodMode = LodMode::Range;
+        m_useZoneProfiles = false;
+        m_activeZoneHasProfile = false;
+        m_drawDistance = default_draw_distance();
+        m_lodMode = LodMode::High;
         m_lodRangeScale = 1.0f;
-        m_fogMode = FogMode::Off;
-        m_fogStart = 20.0f;
-        m_fogEnd = 120.0f;
+        m_fogMode = FogMode::Game;
+        m_fogStart = kDefaultFogStart;
+        m_fogEnd = kDefaultFogEnd;
     }
 
     void cleanup_old_config_sections()
@@ -1025,7 +1260,15 @@ private:
 
         m_originalFogStart = clamp_float(value, 0.0f, kMaxFogDistance);
         m_originalFogStartCaptured = true;
-        if (m_fogMode == FogMode::Off)
+        if (m_gameFogSampling && m_fogMode == FogMode::Game)
+        {
+            m_fogStart = m_originalFogStart;
+            m_gameFogSawStart = true;
+            if (m_gameFogSawEnd)
+                m_fogEnd = clamp_float(m_fogEnd, m_fogStart + 1.0f, kMaxFogDistance);
+            return;
+        }
+        if (m_fogMode == FogMode::DistanceLinked)
             m_fogStart = m_originalFogStart;
     }
 
@@ -1036,7 +1279,13 @@ private:
 
         m_originalFogEnd = clamp_float(value, 1.0f, kMaxFogDistance);
         m_originalFogEndCaptured = true;
-        if (m_fogMode == FogMode::Off)
+        if (m_gameFogSampling && m_fogMode == FogMode::Game)
+        {
+            m_fogEnd = clamp_float(m_originalFogEnd, m_fogStart + 1.0f, kMaxFogDistance);
+            m_gameFogSawEnd = true;
+            return;
+        }
+        if (m_fogMode == FogMode::DistanceLinked)
             m_fogEnd = clamp_float(m_originalFogEnd, m_fogStart + 1.0f, kMaxFogDistance);
     }
 
@@ -1052,22 +1301,93 @@ private:
     {
         if (m_device == nullptr)
             return;
+
+        m_applyingForcedFogState = true;
         if (m_originalFogStartCaptured)
             m_device->SetRenderState(D3DRS_FOGSTART, float_to_dword(m_originalFogStart));
         if (m_originalFogEndCaptured)
             m_device->SetRenderState(D3DRS_FOGEND, float_to_dword(m_originalFogEnd));
+        m_applyingForcedFogState = false;
+    }
+
+    void reset_game_fog_sample(const bool syncFromOriginal)
+    {
+        m_gameFogSampling = false;
+        m_gameFogSawStart = false;
+        m_gameFogSawEnd = false;
+        if (syncFromOriginal)
+            sync_default_fog_range();
+    }
+
+    void begin_game_fog_sample(const bool isRenderingBackBuffer)
+    {
+        if (!isRenderingBackBuffer || m_fogMode != FogMode::Game || m_gameFogSampling)
+            return;
+
+        if (!capture_original_draw_distances())
+            return;
+        if (!restore_draw_distances())
+            return;
+
+        m_gameFogSampling = true;
+        m_gameFogSawStart = false;
+        m_gameFogSawEnd = false;
+    }
+
+    void finish_game_fog_sample()
+    {
+        if (!m_gameFogSampling)
+            return;
+
+        m_gameFogSampling = false;
+        apply_draw_distances();
+    }
+
+    void finish_game_fog_sample_if_ready()
+    {
+        if (m_gameFogSampling && m_gameFogSawStart && m_gameFogSawEnd)
+            finish_game_fog_sample();
+    }
+
+    void apply_fog_state_before_draw()
+    {
+        finish_game_fog_sample();
+        apply_forced_fog_state();
+    }
+
+    void apply_forced_fog_state()
+    {
+        if (m_device == nullptr || !should_force_fog_state() || m_applyingForcedFogState)
+            return;
+
+        struct ShaderFogConstant
+        {
+            float scale;
+            float unused0;
+            float end;
+            float unused1;
+        };
+
+        const float range = std::max(m_fogEnd - m_fogStart, 1.0f);
+        const ShaderFogConstant shaderFog{ 1.0f / range, 0.0f, m_fogEnd, 0.0f };
+
+        m_applyingForcedFogState = true;
+        m_device->SetRenderState(D3DRS_FOGSTART, float_to_dword(m_fogStart));
+        m_device->SetRenderState(D3DRS_FOGEND, float_to_dword(m_fogEnd));
+        m_device->SetRenderState(D3DRS_FOGVERTEXMODE, D3DFOG_LINEAR);
+        m_device->SetRenderState(D3DRS_FOGTABLEMODE, D3DFOG_NONE);
+        m_device->SetRenderState(D3DRS_RANGEFOGENABLE, FALSE);
+        m_device->SetVertexShaderConstant(9, &shaderFog, 1);
+        m_applyingForcedFogState = false;
     }
 
     void restore_default_runtime()
     {
-        m_lodMode = LodMode::Off;
-        m_lodRangeScale = 1.0f;
-        m_fogMode = FogMode::Off;
-        restore_draw_distances();
-        restore_lod_patches();
-        sync_default_draw_distance();
-        sync_default_fog_range();
-        restore_fog_state();
+        finish_game_fog_sample();
+        reset_config_to_defaults();
+        apply_draw_distances();
+        apply_lod_mode();
+        apply_active_fog_mode();
     }
 
     uint16_t get_current_zone() const
@@ -1086,17 +1406,17 @@ private:
 
     void load_active_profile()
     {
-        load_global_profile(8);
+        load_global_profile(kConfigVersion);
+        m_activeZoneHasProfile = false;
         if (m_useZoneProfiles && m_currentZoneId != 0)
-            load_zone_profile(m_currentZoneId);
+            m_activeZoneHasProfile = load_zone_profile(m_currentZoneId);
     }
 
     void apply_loaded_profile()
     {
         apply_draw_distances();
         apply_lod_mode();
-        if (m_fogMode == FogMode::Off)
-            restore_fog_state();
+        apply_active_fog_mode();
     }
 
     void update_zone_profile()
@@ -1105,7 +1425,7 @@ private:
         if (zoneId == 0 || zoneId == m_currentZoneId)
             return;
 
-        if (m_useZoneProfiles && m_currentZoneId != 0)
+        if (m_useZoneProfiles && m_currentZoneId != 0 && m_activeZoneHasProfile)
             save_zone_profile(m_currentZoneId);
 
         m_currentZoneId = zoneId;
@@ -1113,7 +1433,6 @@ private:
         {
             load_active_profile();
             apply_loaded_profile();
-            save_config();
         }
     }
 
@@ -1131,24 +1450,16 @@ private:
         m_useZoneProfiles = enabled;
         if (m_useZoneProfiles && m_currentZoneId != 0)
         {
-            char section[32]{};
-            zone_section_name(m_currentZoneId, section, sizeof(section));
-            if (profile_section_exists(section))
-            {
-                load_active_profile();
-                apply_loaded_profile();
-            }
-            else
-            {
-                save_zone_profile(m_currentZoneId);
-            }
+            load_active_profile();
+            apply_loaded_profile();
         }
         else
         {
-            load_global_profile(8);
+            load_global_profile(kConfigVersion);
+            m_activeZoneHasProfile = false;
             apply_loaded_profile();
         }
-        save_config();
+        save_config(false);
     }
 
     bool apply_lod_mode()
@@ -1281,22 +1592,27 @@ private:
     float m_originalEntityDistance = 0.0f;
     BytesPatchSite m_lodPatchSites[2]{};
     BytesPatchSite m_lodRangePatchSites[4]{};
-    float m_drawDistance = kDefaultDrawDistance;
+    float m_drawDistance = default_draw_distance();
     enum class LodMode : int
     {
         Off = 0,
         High = 1,
         Range = 2,
     };
-    LodMode m_lodMode = LodMode::Off;
+    LodMode m_lodMode = LodMode::High;
     float m_lodRangeScale = 1.0f;
-    FogMode m_fogMode = FogMode::Off;
-    float m_fogStart = 20.0f;
-    float m_fogEnd = 120.0f;
+    FogMode m_fogMode = FogMode::Game;
+    float m_fogStart = kDefaultFogStart;
+    float m_fogEnd = kDefaultFogEnd;
     bool m_originalFogStartCaptured = false;
     bool m_originalFogEndCaptured = false;
-    float m_originalFogStart = 20.0f;
-    float m_originalFogEnd = 120.0f;
+    float m_originalFogStart = kDefaultFogStart;
+    float m_originalFogEnd = kDefaultFogEnd;
+    bool m_applyingForcedFogState = false;
+    bool m_gameFogSampling = false;
+    bool m_gameFogSawStart = false;
+    bool m_gameFogSawEnd = false;
+    bool m_activeZoneHasProfile = false;
     bool m_useZoneProfiles = false;
     uint16_t m_currentZoneId = 0;
     bool m_windowOpen = false;
