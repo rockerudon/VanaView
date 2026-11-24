@@ -1,5 +1,9 @@
 # VanaView
 
+> [!IMPORTANT]
+> **This repository is archived and no longer maintained.**
+> Please use the updated fork: **https://github.com/By-T0r/VanaView**
+
 An [Ashita v4](https://www.ashitaxi.com/) plugin for **Final Fantasy XI**.
 
 VanaView adds an ImGui window for tuning the client's visual distance, map
