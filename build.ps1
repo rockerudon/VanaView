@@ -56,5 +56,7 @@ if ($LASTEXITCODE -ne 0) {
     throw "VanaView build failed with exit code $LASTEXITCODE."
 }
 
+& (Join-Path $root 'tools\Test-Plugin.ps1') -PluginPath $outDll
+
 Write-Host "Built: $outDll"
 Write-Host 'Copy it to Ashita/plugins/ and load it in game with: /load vanaview'
